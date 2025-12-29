@@ -18,7 +18,7 @@ jobs:
           cache: 'pip'
       - run: pip install -r requirements.txt
       - name: Fetch data and produce prodcal.ics
-        run: python prodcal_ics.py --start-year=2018 -o /tmp/prodcal.ics
+        run: python prodcal_ics.py --start-year=2025 -o /tmp/prodcal.ics
       - uses: actions/upload-artifact@v4
         with:
           name: prodcal.ics
