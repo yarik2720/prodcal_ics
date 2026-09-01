@@ -2,77 +2,171 @@
 # -*- coding: utf-8 -*-
 
 from icalendar import Calendar, Event
-from lxml import html
 import requests
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import argparse
 import logging
 import hashlib
+import xml.etree.ElementTree as ET
 
 
-def get_holidays_grouped_by_months(year):
-    url = f"https://hh.ru/article/calendar{year}"
+XMLCALENDAR_URL = "https://xmlcalendar.ru/data/ru/{year}/calendar.xml"
+
+
+def parse_xmlcalendar_data(year, xml_data):
+    try:
+        root = ET.fromstring(xml_data)
+    except ET.ParseError as error:
+        raise ValueError(
+            f"Invalid XML received from production calendar source for {year}"
+        ) from error
+
+    if root.tag != "calendar" or root.get("year") != str(year):
+        raise ValueError(f"Unexpected calendar year in response for {year}")
+
+    holidays_element = root.find("holidays")
+    days_element = root.find("days")
+    if holidays_element is None or days_element is None:
+        raise ValueError(f"Missing holidays or days section in calendar for {year}")
+
+    holiday_titles = {}
+    for holiday in holidays_element.findall("holiday"):
+        holiday_id = holiday.get("id")
+        title = holiday.get("title")
+        if not holiday_id or not title:
+            raise ValueError(f"Invalid holiday definition in calendar for {year}")
+        if holiday_id in holiday_titles:
+            raise ValueError(
+                f"Duplicate holiday id in calendar for {year}: {holiday_id}"
+            )
+        holiday_titles[holiday_id] = title
+
+    special_days = {}
+    for day_element in days_element.findall("day"):
+        date_value = day_element.get("d")
+        day_type = day_element.get("t")
+        holiday_id = day_element.get("h")
+
+        try:
+            month_value, day_value = date_value.split(".")
+            calendar_date = date(year, int(month_value), int(day_value))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Invalid day value in calendar for {year}: {date_value}"
+            ) from error
+
+        if date_value != calendar_date.strftime("%m.%d"):
+            raise ValueError(f"Invalid day format in calendar for {year}: {date_value}")
+        if day_type not in {"1", "2", "3"}:
+            raise ValueError(
+                f"Invalid day type in calendar for {calendar_date}: {day_type}"
+            )
+        if holiday_id is not None and holiday_id not in holiday_titles:
+            raise ValueError(
+                f"Unknown holiday id in calendar for {calendar_date}: {holiday_id}"
+            )
+        if calendar_date in special_days:
+            raise ValueError(f"Duplicate day in calendar for {calendar_date}")
+
+        special_days[calendar_date] = {
+            "type": day_type,
+            "holiday_id": holiday_id,
+        }
+
+    days_off = []
+    shortened_days = []
+    calendar_date = date(year, 1, 1)
+    end_date = date(year + 1, 1, 1)
+
+    while calendar_date < end_date:
+        special_day = special_days.get(calendar_date)
+
+        if special_day is not None:
+            if special_day["type"] == "1":
+                summary = holiday_titles.get(
+                    special_day["holiday_id"], "Выходной"
+                )
+                days_off.append((calendar_date, summary))
+            elif special_day["type"] == "2":
+                shortened_days.append(calendar_date)
+        elif calendar_date.weekday() >= 5:
+            days_off.append((calendar_date, "Выходной"))
+
+        calendar_date += timedelta(days=1)
+
+    return {"days_off": days_off, "shortened_days": shortened_days}
+
+
+def get_calendar_data(year):
+    url = XMLCALENDAR_URL.format(year=year)
 
     logging.info(url)
 
-    headers = {"User-Agent": "curl/7.68.0"}
+    headers = {
+        "User-Agent": "prodcal_ics/1.0 (+https://github.com/yarik2720/prodcal_ics)"
+    }
 
-    page = requests.get(url, headers=headers, allow_redirects=True)
+    response = requests.get(
+        url, headers=headers, allow_redirects=True, timeout=30
+    )
 
-    if page.status_code == 404:
+    if response.status_code == 404:
+        logging.warning("Production calendar for %s is not available yet", year)
         return None
 
-    tree = html.fromstring(page.content)
-    months = tree.xpath(
-        "//div[@class='calendar-list__item__title' or @class='calendar-list__item-title']/.."
-    )
+    response.raise_for_status()
 
-    if len(months) != 12:
-        raise Exception(
-            f"len(months) ({year} year) must be equal to 12, actual: {len(months)}"
-        )
-
-    holidays = []
-
-    for m in months:
-        holidays_in_month = m.xpath(
-            ".//li[contains(@class, 'calendar-list__numbers__item_day-off')]/text()"
-        )
-        holidays_in_month = [day.strip() for day in holidays_in_month if day.strip()]
-        holidays.append([int(day) for day in holidays_in_month])
-
-    return holidays
+    return parse_xmlcalendar_data(year, response.content)
 
 
-def create_dayoff_event(year, month, day_start, day_end):
+def create_all_day_event(summary, day_start, day_end):
     event = Event()
-    event.add("summary", "Выходной")
-    event.add("dtstart", datetime(year, month, day_start, 0, 0, 0).date())
-    event.add(
-        "dtend", datetime(year, month, day_end, 0, 0, 0).date() + timedelta(days=1)
-    )
+    event.add("summary", summary)
+    event.add("dtstart", day_start)
+    event.add("dtend", day_end + timedelta(days=1))
 
     # UID is REQUIRED https://tools.ietf.org/html/rfc5545#section-3.6.1
     uid = hashlib.sha512(
-        f"{year}{month}{day_start}{day_end}".encode("ascii")
+        f"{summary}\0{day_start.isoformat()}\0{day_end.isoformat()}".encode("utf-8")
     ).hexdigest()
     event.add("uid", uid)
 
     return event
 
 
-def generate_events(year, holidays_by_months):
-    import more_itertools as mit
-
+def generate_events(calendar_data):
     events = []
+    days_off = calendar_data["days_off"]
 
-    for month, holidays in enumerate(holidays_by_months, start=1):
-        holidays_groups = [list(group) for group in mit.consecutive_groups(holidays)]
+    if days_off:
+        group_start, group_summary = days_off[0]
+        group_end = group_start
 
-        for g in holidays_groups:
-            e = create_dayoff_event(year, month, g[0], g[-1])
-            events.append(e)
+        for calendar_date, summary in days_off[1:]:
+            if (
+                calendar_date == group_end + timedelta(days=1)
+                and summary == group_summary
+            ):
+                group_end = calendar_date
+                continue
+
+            events.append(
+                create_all_day_event(group_summary, group_start, group_end)
+            )
+            group_start = group_end = calendar_date
+            group_summary = summary
+
+        events.append(create_all_day_event(group_summary, group_start, group_end))
+
+    for calendar_date in calendar_data["shortened_days"]:
+        events.append(
+            create_all_day_event(
+                "Сокращённый рабочий день", calendar_date, calendar_date
+            )
+        )
+
+    events.sort(key=lambda event: event.decoded("dtstart"))
 
     return events
 
@@ -146,14 +240,14 @@ if __name__ == "__main__":
 
     # (args.end_year + 1) because range() function doesn't include right margin
     for year in range(args.start_year, args.end_year + 1, 1):
-        holidays_by_months = get_holidays_grouped_by_months(year)
+        calendar_data = get_calendar_data(year)
 
-        if not holidays_by_months:
+        if not calendar_data:
             break
 
-        events += generate_events(year, holidays_by_months)
+        events += generate_events(calendar_data)
 
     cal = generate_calendar(events)
 
-    with open(args.output_file, "w") as f:
-        f.write(cal.to_ical().decode("utf-8"))
+    with open(args.output_file, "wb") as f:
+        f.write(cal.to_ical())
