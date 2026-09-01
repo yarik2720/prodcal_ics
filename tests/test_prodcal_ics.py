@@ -63,7 +63,7 @@ class GetCalendarDataTest(unittest.TestCase):
         self.assertEqual(result["shortened_days"], [date(2026, 1, 2)])
         response.raise_for_status.assert_called_once_with()
         requests_get.assert_called_once_with(
-            "https://xmlcalendar.ru/data/ru/2026/calendar.xml",
+            "https://xmlcalendar.github.io/data/ru/2026/calendar.xml",
             headers={
                 "User-Agent": (
                     "prodcal_ics/1.0 "

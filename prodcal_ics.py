@@ -11,7 +11,7 @@ import hashlib
 import xml.etree.ElementTree as ET
 
 
-XMLCALENDAR_URL = "https://xmlcalendar.ru/data/ru/{year}/calendar.xml"
+XMLCALENDAR_URL = "https://xmlcalendar.github.io/data/ru/{year}/calendar.xml"
 
 
 def parse_xmlcalendar_data(year, xml_data):
